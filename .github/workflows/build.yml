@@ -1,0 +1,55 @@
+name: Build and test
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    runs-on: windows-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      - name: Set up vcpkg
+        shell: pwsh
+        run: |
+          git clone --depth 1 https://github.com/microsoft/vcpkg "$env:RUNNER_TEMP\vcpkg"
+          & "$env:RUNNER_TEMP\vcpkg\bootstrap-vcpkg.bat" -disableMetrics
+
+      - name: Configure
+        shell: pwsh
+        run: |
+          cmake -S . -B out/build `
+            -DCMAKE_TOOLCHAIN_FILE="$env:RUNNER_TEMP\vcpkg\scripts\buildsystems\vcpkg.cmake"
+
+      - name: Build
+        shell: pwsh
+        run: |
+          cmake --build out/build --config Release --parallel
+
+      - name: Run integration tester
+        shell: pwsh
+        run: |
+          $exe = Get-ChildItem out -Recurse -Filter "StickersFTW*.exe" |
+            Where-Object { $_.FullName -notmatch "CMakeFiles" } |
+            Select-Object -First 1
+
+          if (-not $exe) {
+            throw "Could not find the built StickersFTW executable."
+          }
+
+          python bulk_tester.py $exe.FullName --show-server-log
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: StickersFTW-Windows
+          path: |
+            out/**/StickersFTW*.exe
+          if-no-files-found: error
