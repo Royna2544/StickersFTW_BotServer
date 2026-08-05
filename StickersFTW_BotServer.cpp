@@ -12,6 +12,7 @@
 #include <spdlog/spdlog.h>
 
 #include <atomic>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <expected>
@@ -261,12 +262,57 @@ void from_json(const BasicJsonType &nlohmann_json_j,
 };
 
 constexpr int HTTP_OK = 200;
+constexpr int HTTP_CREATED = 201;
 constexpr int HTTP_BAD_REQUEST = 400;
 constexpr int HTTP_UNAUTHORIZED = 401;
 constexpr int HTTP_FORBIDDEN = 403;
 constexpr int HTTP_NOT_FOUND = 404;
 constexpr int HTTP_TOO_MANY_REQUESTS = 429;
 constexpr int HTTP_INTERNAL_SERVER_ERROR = 500;
+
+// Writes an ErrorResponse as the actual JSON response body, so clients can
+// see the real failure reason instead of a bare status code.
+void writeError(httplib::Response &res, const ErrorResponse &err) {
+  res.status = err.error_code;
+  res.set_content(nlohmann::json(err).dump(), "application/json");
+}
+
+// Splits a comma-separated list (e.g. an emoji list) into trimmed,
+// non-empty parts. Deliberately simple/manual rather than std::views::split
+// to avoid any ambiguity in this codebase's C++23 ranges usage.
+std::vector<std::string> splitCommaList(const std::string &raw) {
+  std::vector<std::string> result;
+  std::string current;
+  for (char c : raw) {
+    if (c == ',') {
+      if (!current.empty()) {
+        result.push_back(current);
+        current.clear();
+      }
+    } else {
+      current += c;
+    }
+  }
+  if (!current.empty()) {
+    result.push_back(current);
+  }
+  return result;
+}
+
+// Validates a client-supplied sticker set short name against Telegram's own
+// naming rule (must start with a letter, letters/digits/underscores only)
+// before it gets combined into "<name>_by_<bot_username>".
+std::optional<std::string> sanitizeShortName(const std::string &raw) {
+  if (raw.empty() || !std::isalpha(static_cast<unsigned char>(raw[0]))) {
+    return std::nullopt;
+  }
+  for (char c : raw) {
+    if (!std::isalnum(static_cast<unsigned char>(c)) && c != '_') {
+      return std::nullopt;
+    }
+  }
+  return raw;
+}
 
 class StickerFTWEngine {
   httplib::Client cli; // Client of Telegram API Server
@@ -287,6 +333,10 @@ class StickerFTWEngine {
 
   // Token and API server URL for Telegram API
   std::string token;
+
+  // Cached from the startup getMe() call; needed to build the canonical
+  // "<name>_by_<bot_username>" sticker set name Telegram requires on create.
+  std::string bot_username;
 
   using http_code_t = int;
 
@@ -517,7 +567,11 @@ public:
       case HTTP_BAD_REQUEST:
       case HTTP_NOT_FOUND:
       case HTTP_TOO_MANY_REQUESTS:
-        return ErrorResponse(resp.error_code, "Telegram API error.");
+        // Preserve Telegram's real description (e.g. "STICKERSET_INVALID",
+        // "PEER_ID_INVALID") instead of a generic message -- callers (in
+        // particular pushSticker) inspect this text, and clients benefit
+        // from seeing the real reason now that errors carry a JSON body.
+        return ErrorResponse(resp.error_code, resp.description);
       default:
         return ErrorResponse(HTTP_INTERNAL_SERVER_ERROR,
                              "Internal server error.");
@@ -622,6 +676,225 @@ public:
         fmt::format("getFile for sticker file with file_id '{}'", file_id)));
   }
 
+  // Uploads raw sticker bytes to Telegram, returning the resulting file_id
+  // that createNewStickerSet/addStickerToSet can then reference without
+  // re-uploading the binary.
+  std::expected<std::string, ErrorResponse>
+  uploadStickerFile(const std::string &user_id, const std::string &sticker_data,
+                    const std::string &sticker_format,
+                    const std::string &filename) {
+    if (is_ratelimited()) {
+      return std::unexpected(
+          ErrorResponse(HTTP_TOO_MANY_REQUESTS, "Rate limit in effect."));
+    }
+
+    httplib::UploadFormDataItems items = {
+        {"user_id", user_id, "", ""},
+        {"sticker_format", sticker_format, "", ""},
+        {"sticker", sticker_data, filename, "application/octet-stream"},
+    };
+    auto response = cli.Post(make_api_url(token, "uploadStickerFile"), items);
+    if (!response) {
+      spdlog::error("Failed to reach Telegram API for uploadStickerFile. "
+                    "Error code: {}",
+                    static_cast<int>(response.error()));
+      return std::unexpected(ErrorResponse(
+          HTTP_INTERNAL_SERVER_ERROR,
+          "Failed to reach Telegram API for uploadStickerFile."));
+    }
+    auto body_opt = unwrapTelegramBody(response->body);
+    if (!body_opt) {
+      return std::unexpected(
+          ErrorResponse(HTTP_INTERNAL_SERVER_ERROR,
+                        "Failed to unwrap uploadStickerFile response body."));
+    }
+    auto body = body_opt.value();
+    if (response->status != HTTP_OK) {
+      return std::unexpected(
+          http_code_err_handle(body.error(), "uploadStickerFile"));
+    }
+    std::string file_id = body->value("file_id", "");
+    if (file_id.empty()) {
+      return std::unexpected(
+          ErrorResponse(HTTP_INTERNAL_SERVER_ERROR,
+                        "uploadStickerFile response did not contain a file_id."));
+    }
+    return file_id;
+  }
+
+  // Creates a brand-new sticker set owned by user_id, seeded with a single
+  // already-uploaded sticker (referenced by file_id).
+  std::expected<void, ErrorResponse>
+  createNewStickerSet(const std::string &user_id, const std::string &full_name,
+                      const std::string &title, const std::string &file_id,
+                      const std::string &sticker_format,
+                      const std::vector<std::string> &emojis) {
+    if (is_ratelimited()) {
+      return std::unexpected(
+          ErrorResponse(HTTP_TOO_MANY_REQUESTS, "Rate limit in effect."));
+    }
+
+    nlohmann::json input_sticker = {
+        {"sticker", file_id},
+        {"format", sticker_format},
+        {"emoji_list", emojis},
+    };
+    nlohmann::json stickers_arr = nlohmann::json::array({input_sticker});
+    httplib::Params params{
+        {"user_id", user_id},
+        {"name", full_name},
+        {"title", title},
+        {"stickers", stickers_arr.dump()},
+    };
+    auto response = cli.Post(make_api_url(token, "createNewStickerSet"), params);
+    if (!response) {
+      return std::unexpected(ErrorResponse(
+          HTTP_INTERNAL_SERVER_ERROR,
+          "Failed to reach Telegram API for createNewStickerSet."));
+    }
+    auto body_opt = unwrapTelegramBody(response->body);
+    if (!body_opt) {
+      return std::unexpected(
+          ErrorResponse(HTTP_INTERNAL_SERVER_ERROR,
+                        "Failed to unwrap createNewStickerSet response body."));
+    }
+    auto body = body_opt.value();
+    if (response->status != HTTP_OK) {
+      return std::unexpected(
+          http_code_err_handle(body.error(), "createNewStickerSet"));
+    }
+    return {};
+  }
+
+  // Appends a single already-uploaded sticker (by file_id) to an existing
+  // set owned by user_id.
+  std::expected<void, ErrorResponse>
+  addStickerToSet(const std::string &user_id, const std::string &full_name,
+                  const std::string &file_id, const std::string &sticker_format,
+                  const std::vector<std::string> &emojis) {
+    if (is_ratelimited()) {
+      return std::unexpected(
+          ErrorResponse(HTTP_TOO_MANY_REQUESTS, "Rate limit in effect."));
+    }
+
+    nlohmann::json input_sticker = {
+        {"sticker", file_id},
+        {"format", sticker_format},
+        {"emoji_list", emojis},
+    };
+    httplib::Params params{
+        {"user_id", user_id},
+        {"name", full_name},
+        {"sticker", input_sticker.dump()},
+    };
+    auto response = cli.Post(make_api_url(token, "addStickerToSet"), params);
+    if (!response) {
+      return std::unexpected(
+          ErrorResponse(HTTP_INTERNAL_SERVER_ERROR,
+                        "Failed to reach Telegram API for addStickerToSet."));
+    }
+    auto body_opt = unwrapTelegramBody(response->body);
+    if (!body_opt) {
+      return std::unexpected(
+          ErrorResponse(HTTP_INTERNAL_SERVER_ERROR,
+                        "Failed to unwrap addStickerToSet response body."));
+    }
+    auto body = body_opt.value();
+    if (response->status != HTTP_OK) {
+      return std::unexpected(
+          http_code_err_handle(body.error(), "addStickerToSet"));
+    }
+    return {};
+  }
+
+  struct PushResult {
+    GetStickerSetResponse set;
+    bool created;
+  };
+
+  // Orchestrates a full "push a sticker to Telegram" request: uploads the
+  // file, tries to append it to an existing set, and falls back to creating
+  // a brand-new set (only if the caller supplied a title) when the set
+  // doesn't exist yet. This is what backs POST /v1/set/{name}/.
+  std::expected<PushResult, ErrorResponse>
+  pushSticker(const std::string &short_name, const std::string &user_id,
+             const std::optional<std::string> &title,
+             const std::string &sticker_data, const std::string &sticker_format,
+             const std::vector<std::string> &emojis) {
+    if (user_id.empty()) {
+      return std::unexpected(
+          ErrorResponse(HTTP_BAD_REQUEST, "user_id is required."));
+    }
+    if (sticker_format != "static" && sticker_format != "video") {
+      return std::unexpected(
+          ErrorResponse(HTTP_BAD_REQUEST, "format must be 'static' or 'video'."));
+    }
+    if (emojis.empty() || emojis.size() > 3) {
+      return std::unexpected(
+          ErrorResponse(HTTP_BAD_REQUEST, "1 to 3 emojis are required."));
+    }
+    auto sanitized = sanitizeShortName(short_name);
+    if (!sanitized) {
+      return std::unexpected(ErrorResponse(
+          HTTP_BAD_REQUEST,
+          "Invalid sticker set name. Must start with a letter and contain "
+          "only letters, digits and underscores."));
+    }
+    if (bot_username.empty()) {
+      return std::unexpected(
+          ErrorResponse(HTTP_INTERNAL_SERVER_ERROR, "Bot username unavailable."));
+    }
+    std::string full_name = *sanitized + "_by_" + bot_username;
+    if (full_name.size() > 64) {
+      return std::unexpected(
+          ErrorResponse(HTTP_BAD_REQUEST, "Sticker set name too long."));
+    }
+
+    std::string filename = "sticker." + std::string(
+        sticker_format == "video" ? "webm" : "webp");
+    auto file_id_result =
+        uploadStickerFile(user_id, sticker_data, sticker_format, filename);
+    if (!file_id_result) {
+      return std::unexpected(file_id_result.error());
+    }
+    std::string file_id = file_id_result.value();
+
+    bool created = false;
+    auto add_result =
+        addStickerToSet(user_id, full_name, file_id, sticker_format, emojis);
+    if (!add_result) {
+      bool set_missing =
+          add_result.error().description.find("STICKERSET_INVALID") !=
+          std::string::npos;
+      if (set_missing && title.has_value() && !title->empty()) {
+        auto create_result = createNewStickerSet(
+            user_id, full_name, *title, file_id, sticker_format, emojis);
+        if (!create_result) {
+          return std::unexpected(create_result.error());
+        }
+        created = true;
+      } else if (set_missing) {
+        return std::unexpected(ErrorResponse(
+            HTTP_BAD_REQUEST,
+            "Sticker set does not exist yet; provide 'title' to create it."));
+      } else {
+        return std::unexpected(add_result.error());
+      }
+    }
+
+    // The set changed on Telegram's side -- drop any cached copy so the
+    // re-fetch below reflects the push we just made.
+    {
+      std::lock_guard<std::mutex> lock(cache_mutex);
+      sticker_sets_cache.erase(full_name);
+    }
+    auto refreshed = getStickerSet(full_name);
+    if (!refreshed) {
+      return std::unexpected(refreshed.error());
+    }
+    return PushResult{refreshed.value(), created};
+  }
+
   bool listen(std::string ipaddr, const int port) {
     // Try a quick #getMe, testing both the token and the API server URL, before
     // starting the server.
@@ -635,9 +908,23 @@ public:
       return false;
     }
 
+    // Capture the bot's own username, needed to build canonical
+    // "<name>_by_<bot_username>" sticker set names for push support.
+    auto getMeBodyOpt = unwrapTelegramBody(getMeRes->body);
+    if (!getMeBodyOpt || !getMeBodyOpt->has_value()) {
+      spdlog::error("Failed to parse getMe response body.");
+      return false;
+    }
+    bot_username = getMeBodyOpt->value().value("username", "");
+    if (bot_username.empty()) {
+      spdlog::error("getMe response did not include a bot username.");
+      return false;
+    }
+    spdlog::info("Authenticated as bot @{}", bot_username);
+
     // Thumbnail image get
-    svr.Get("/set/(.*)/(.*)/thumbnail/", [&](const httplib::Request &req,
-                                             httplib::Response &res) {
+    svr.Get("/v1/set/([^/]+)/([^/]+)/thumbnail/?",
+            [&](const httplib::Request &req, httplib::Response &res) {
       std::string sticker_set_name = req.matches[1];
       std::string sticker_id = req.matches[2];
 
@@ -647,8 +934,8 @@ public:
 
       auto sticker_set_result = getStickerSet(sticker_set_name);
       if (!sticker_set_result) {
-        // Set not found? Return the error code from getStickerSet
-        res.status = sticker_set_result.error().error_code;
+        // Set not found? Return the error from getStickerSet
+        writeError(res, sticker_set_result.error());
         return;
       } else {
         auto sticker_set = sticker_set_result.value();
@@ -658,18 +945,20 @@ public:
         if (sticker_file_it == sticker_set.stickers.end()) {
           spdlog::warn("Sticker with id '{}' not found in sticker set '{}'.",
                        sticker_id, sticker_set_name);
-          res.status = HTTP_NOT_FOUND;
+          writeError(res, ErrorResponse(HTTP_NOT_FOUND,
+                                        "Sticker not found in this set."));
           return;
         }
         if (!sticker_file_it->thumb_file_id) {
           spdlog::warn("This sticker does not have thumbnail");
-          res.status = HTTP_NOT_FOUND;
+          writeError(res, ErrorResponse(HTTP_NOT_FOUND,
+                                        "This sticker has no thumbnail."));
           return;
         }
         auto sticker_file_result =
             getStickerFile(*sticker_file_it->thumb_file_id);
         if (!sticker_file_result) {
-          res.status = sticker_file_result.error().error_code;
+          writeError(res, sticker_file_result.error());
           return;
         } else {
           auto sticker_data = sticker_file_result.value();
@@ -679,8 +968,8 @@ public:
     });
 
     // Sticker image get
-    svr.Get("/set/(.*)/(.*)/", [&](const httplib::Request &req,
-                                   httplib::Response &res) {
+    svr.Get("/v1/set/([^/]+)/([^/]+)/?",
+            [&](const httplib::Request &req, httplib::Response &res) {
       std::string sticker_set_name = req.matches[1];
       std::string sticker_id = req.matches[2];
 
@@ -689,8 +978,8 @@ public:
 
       auto sticker_set_result = getStickerSet(sticker_set_name);
       if (!sticker_set_result) {
-        // Set not found? Return the error code from getStickerSet
-        res.status = sticker_set_result.error().error_code;
+        // Set not found? Return the error from getStickerSet
+        writeError(res, sticker_set_result.error());
         return;
       } else {
         auto sticker_set = sticker_set_result.value();
@@ -700,12 +989,13 @@ public:
         if (sticker_file_it == sticker_set.stickers.end()) {
           spdlog::warn("Sticker with id '{}' not found in sticker set '{}'.",
                        sticker_id, sticker_set_name);
-          res.status = HTTP_NOT_FOUND;
+          writeError(res, ErrorResponse(HTTP_NOT_FOUND,
+                                        "Sticker not found in this set."));
           return;
         }
         auto sticker_file_result = getStickerFile(sticker_file_it->file_id);
         if (!sticker_file_result) {
-          res.status = sticker_file_result.error().error_code;
+          writeError(res, sticker_file_result.error());
           return;
         } else {
           auto sticker_data = sticker_file_result.value();
@@ -715,17 +1005,74 @@ public:
     });
 
     // Sticker set get
-    svr.Get(
-        "/set/(.*)/", [&](const httplib::Request &req, httplib::Response &res) {
+    svr.Get("/v1/set/([^/]+)/?",
+            [&](const httplib::Request &req, httplib::Response &res) {
           std::string sticker_set_name = req.matches[1];
+
+          spdlog::debug("Received request for sticker set: '{}'", sticker_set_name);
+
           auto sticker_set_result = getStickerSet(sticker_set_name);
           if (!sticker_set_result) {
-            res.status = sticker_set_result.error().error_code;
+            writeError(res, sticker_set_result.error());
           } else {
             res.set_content(nlohmann::json(sticker_set_result.value()).dump(),
                             "application/json");
           }
         });
+
+    // Bot identity get (purely informational -- lets clients show the
+    // correct "@bot_username" in their own UI instructions).
+    svr.Get("/v1/bot/?", [&](const httplib::Request &req,
+                             httplib::Response &res) {
+      (void)req;
+      nlohmann::json j;
+      j["username"] = bot_username;
+      res.set_content(j.dump(), "application/json");
+    });
+
+    // Push a sticker to Telegram: appends to an existing set the caller
+    // owns, or creates a brand-new one (if "title" is supplied and the set
+    // doesn't exist yet).
+    svr.Post("/v1/set/([A-Za-z][A-Za-z0-9_]*)/?",
+             [&](const httplib::Request &req, httplib::Response &res) {
+      std::string short_name = req.matches[1];
+
+      if (!req.form.has_field("user_id") || !req.form.has_field("format") ||
+          !req.form.has_field("emojis") || !req.form.has_file("sticker")) {
+        writeError(res, ErrorResponse(
+                            HTTP_BAD_REQUEST,
+                            "Missing required fields: user_id, format, "
+                            "emojis, sticker (file)."));
+        return;
+      }
+
+      std::string user_id = req.form.get_field("user_id");
+      std::string format = req.form.get_field("format");
+      std::string emojis_raw = req.form.get_field("emojis");
+      std::optional<std::string> title;
+      if (req.form.has_field("title")) {
+        std::string title_value = req.form.get_field("title");
+        if (!title_value.empty()) {
+          title = title_value;
+        }
+      }
+      auto emojis = splitCommaList(emojis_raw);
+      auto sticker_file = req.form.get_file("sticker");
+
+      spdlog::debug("Received push request for sticker set short name: '{}'",
+                    short_name);
+
+      auto result = pushSticker(short_name, user_id, title,
+                                sticker_file.content, format, emojis);
+      if (!result) {
+        writeError(res, result.error());
+        return;
+      }
+
+      res.status = result.value().created ? HTTP_CREATED : HTTP_OK;
+      res.set_content(nlohmann::json(result.value().set).dump(),
+                      "application/json");
+    });
 
     return svr.listen(ipaddr, port, 0);
   }
@@ -830,7 +1177,7 @@ int main(int argc, char *argv[]) {
 
   StickerFTWEngine engine(token, api_server);
   std::jthread signal_catcher([&]() {
-    while (running || !stop_token_signal.stop_requested()) {
+    while (running && !stop_token_signal.stop_requested()) {
       std::unique_lock<std::mutex> lock(stop_mutex_signal);
       stop_cv_signal.wait_for(
           lock, stop_token_signal, std::chrono::seconds(1),
@@ -840,7 +1187,7 @@ int main(int argc, char *argv[]) {
     engine.shutdown();
   });
   std::jthread cache_purger([&]() {
-    while (running || !stop_token_cache.stop_requested()) {
+    while (running && !stop_token_cache.stop_requested()) {
       std::unique_lock<std::mutex> lock(stop_mutex_cache);
       if (stop_cv_cache.wait_for(lock, stop_token_cache, std::chrono::days(1),
                                  [stop_token_cache] {

@@ -17,6 +17,11 @@ The harness:
        - 400 / 404 / 429 / 500 behavior
        - Telegram retry_after cooldown
        - graceful shutdown
+       - push (uploadStickerFile / createNewStickerSet / addStickerToSet):
+         creating a new set, appending to an existing one, requiring a
+         title for brand-new sets, rejecting a user who hasn't started the
+         bot, rejecting missing fields, and round-tripping a pushed sticker
+         back through the normal download path
 
 Standard-library only.
 
@@ -35,6 +40,7 @@ import gzip
 import hashlib
 import json
 import os
+import re
 import signal
 import socket
 import subprocess
@@ -60,6 +66,12 @@ MALFORMED_JSON_PACK = "MalformedJsonPack_by_FakeBot"
 INVALID_STICKER_PACK = "InvalidStickerPack_by_FakeBot"
 RATE_LIMITED_PACK = "RateLimitedPack_by_FakeBot"
 AFTER_RATE_LIMIT_PACK = "AfterRateLimit_by_FakeBot"
+
+# Push (createNewStickerSet/addStickerToSet/uploadStickerFile) test users.
+# Telegram requires the owning user to have already DM'd the bot; the fake
+# API rejects PUSH_UNSTARTED_USER_ID with PEER_ID_INVALID to simulate that.
+PUSH_VALID_USER_ID = "555555555"
+PUSH_UNSTARTED_USER_ID = "999999999"
 
 STICKER_COUNT = 120
 
@@ -364,6 +376,11 @@ class FakeTelegramState:
     def __init__(self) -> None:
         self._lock = threading.Lock()
         self.calls: Counter[tuple[str, str]] = Counter()
+        # Sticker sets and files created via the push endpoints
+        # (uploadStickerFile / createNewStickerSet / addStickerToSet),
+        # keyed by their full "<name>_by_<bot_username>" Telegram name.
+        self.created_sets: dict[str, dict[str, Any]] = {}
+        self.uploaded_files: dict[str, bytes] = {}
 
     def hit(self, operation: str, key: str = "") -> None:
         with self._lock:
@@ -376,6 +393,76 @@ class FakeTelegramState:
     def snapshot(self) -> Counter[tuple[str, str]]:
         with self._lock:
             return self.calls.copy()
+
+    def register_upload(self, file_id: str, data: bytes) -> None:
+        with self._lock:
+            self.uploaded_files[file_id] = data
+
+    def get_uploaded(self, file_id: str) -> Optional[bytes]:
+        with self._lock:
+            return self.uploaded_files.get(file_id)
+
+    def create_set(
+        self,
+        name: str,
+        title: str,
+        owner: str,
+        sticker: dict[str, Any],
+    ) -> None:
+        with self._lock:
+            self.created_sets[name] = {
+                "title": title,
+                "owner": owner,
+                "stickers": [sticker],
+            }
+
+    def append_sticker(self, name: str, sticker: dict[str, Any]) -> bool:
+        with self._lock:
+            if name not in self.created_sets:
+                return False
+            self.created_sets[name]["stickers"].append(sticker)
+            return True
+
+    def get_created_set(self, name: str) -> Optional[dict[str, Any]]:
+        with self._lock:
+            data = self.created_sets.get(name)
+            if data is None:
+                return None
+            return {
+                "title": data["title"],
+                "owner": data["owner"],
+                "stickers": list(data["stickers"]),
+            }
+
+
+def parse_multipart_formdata(body: bytes, content_type: str) -> dict[str, bytes]:
+    """Minimal multipart/form-data parser for the fake API's own inbound
+    requests (StickersFTW calls Telegram's uploadStickerFile this way).
+    Standard-library only, so this can't reach for a real multipart lib."""
+    match = re.search(r'boundary="?([^";]+)"?', content_type)
+    if not match:
+        return {}
+
+    boundary = ("--" + match.group(1)).encode("utf-8")
+    fields: dict[str, bytes] = {}
+
+    for part in body.split(boundary):
+        part = part.strip(b"\r\n")
+        if not part or part == b"--":
+            continue
+        if b"\r\n\r\n" not in part:
+            continue
+
+        header_blob, content = part.split(b"\r\n\r\n", 1)
+        content = content[: -2] if content.endswith(b"\r\n") else content
+        name_match = re.search(
+            rb'name="([^"]+)"', header_blob
+        )
+        if not name_match:
+            continue
+        fields[name_match.group(1).decode("utf-8")] = content
+
+    return fields
 
 
 class FakeTelegramHandler(BaseHTTPRequestHandler):
@@ -458,6 +545,140 @@ class FakeTelegramHandler(BaseHTTPRequestHandler):
             )
             return
 
+        if method == "uploadStickerFile":
+            self.state.hit("uploadStickerFile")
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length)
+            fields = parse_multipart_formdata(
+                body, self.headers.get("Content-Type", "")
+            )
+            user_id = fields.get("user_id", b"").decode("utf-8", "replace")
+            sticker_format = fields.get("sticker_format", b"").decode(
+                "utf-8", "replace"
+            )
+            sticker_bytes = fields.get("sticker", b"")
+
+            if user_id == PUSH_UNSTARTED_USER_ID:
+                self._send_json(
+                    400,
+                    {
+                        "ok": False,
+                        "error_code": 400,
+                        "description": "Bad Request: PEER_ID_INVALID",
+                    },
+                )
+                return
+
+            if not sticker_bytes or sticker_format not in ("static", "video"):
+                self._send_json(
+                    400,
+                    {
+                        "ok": False,
+                        "error_code": 400,
+                        "description": "Bad Request: STICKER_PNG_NOPNG",
+                    },
+                )
+                return
+
+            file_id = f"pushed_file_{self.state.count('uploadStickerFile')}"
+            self.state.register_upload(file_id, sticker_bytes)
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "result": {
+                        "file_id": file_id,
+                        "file_unique_id": file_id + "_unique",
+                        "file_size": len(sticker_bytes),
+                        "file_path": f"push/{file_id}",
+                    },
+                },
+            )
+            return
+
+        if method == "createNewStickerSet":
+            self.state.hit("createNewStickerSet")
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length)
+            params = urllib.parse.parse_qs(body.decode("utf-8"))
+            user_id = params.get("user_id", [""])[0]
+            name = params.get("name", [""])[0]
+            title = params.get("title", [""])[0]
+            stickers_raw = params.get("stickers", ["[]"])[0]
+
+            if user_id == PUSH_UNSTARTED_USER_ID:
+                self._send_json(
+                    400,
+                    {
+                        "ok": False,
+                        "error_code": 400,
+                        "description": "Bad Request: PEER_ID_INVALID",
+                    },
+                )
+                return
+
+            if self.state.get_created_set(name) is not None:
+                self._send_json(
+                    400,
+                    {
+                        "ok": False,
+                        "error_code": 400,
+                        "description": "Bad Request: STICKERSET_NAME_OCCUPIED",
+                    },
+                )
+                return
+
+            stickers = json.loads(stickers_raw)
+            if not stickers:
+                self._send_json(
+                    400,
+                    {
+                        "ok": False,
+                        "error_code": 400,
+                        "description": "Bad Request: STICKERS_EMPTY",
+                    },
+                )
+                return
+
+            self.state.create_set(name, title, user_id, stickers[0])
+            self._send_json(200, {"ok": True, "result": True})
+            return
+
+        if method == "addStickerToSet":
+            self.state.hit("addStickerToSet")
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length)
+            params = urllib.parse.parse_qs(body.decode("utf-8"))
+            user_id = params.get("user_id", [""])[0]
+            name = params.get("name", [""])[0]
+            sticker_raw = params.get("sticker", ["{}"])[0]
+
+            if user_id == PUSH_UNSTARTED_USER_ID:
+                self._send_json(
+                    400,
+                    {
+                        "ok": False,
+                        "error_code": 400,
+                        "description": "Bad Request: PEER_ID_INVALID",
+                    },
+                )
+                return
+
+            sticker = json.loads(sticker_raw)
+            if not self.state.append_sticker(name, sticker):
+                self._send_json(
+                    400,
+                    {
+                        "ok": False,
+                        "error_code": 400,
+                        "description": "Bad Request: STICKERSET_INVALID",
+                    },
+                )
+                return
+
+            self._send_json(200, {"ok": True, "result": True})
+            return
+
         self._send_json(
             404,
             {
@@ -484,6 +705,23 @@ class FakeTelegramHandler(BaseHTTPRequestHandler):
 
             file_path = "/".join(parts[2:])
             self.state.hit("downloadFile", file_path)
+
+            if file_path.startswith("push/"):
+                pushed_file_id = file_path[len("push/") :]
+                pushed_data = self.state.get_uploaded(pushed_file_id)
+                if pushed_data is None:
+                    self._send_json(
+                        404,
+                        {
+                            "ok": False,
+                            "error_code": 404,
+                            "description": "File not found",
+                        },
+                    )
+                    return
+                self._send_bytes(200, pushed_data)
+                return
+
             file_id = PATH_TO_FILE_ID.get(file_path)
 
             if file_id is None:
@@ -509,6 +747,44 @@ class FakeTelegramHandler(BaseHTTPRequestHandler):
         if method == "getStickerSet":
             name = query.get("name", [""])[0]
             self.state.hit("getStickerSet", name)
+
+            created = self.state.get_created_set(name)
+            if created is not None:
+                self._send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "result": {
+                            "name": name,
+                            "title": created["title"],
+                            "sticker_type": "regular",
+                            "stickers": [
+                                {
+                                    "file_id": sticker["sticker"],
+                                    "file_unique_id": sticker["sticker"]
+                                    + "_unique",
+                                    "type": "regular",
+                                    "width": 512,
+                                    "height": 512,
+                                    "is_animated": False,
+                                    "is_video": sticker.get("format")
+                                    == "video",
+                                    "emoji": (
+                                        sticker.get("emoji_list") or [None]
+                                    )[0],
+                                    "file_size": len(
+                                        self.state.get_uploaded(
+                                            sticker["sticker"]
+                                        )
+                                        or b""
+                                    ),
+                                }
+                                for sticker in created["stickers"]
+                            ],
+                        },
+                    },
+                )
+                return
 
             if name == MISSING_PACK:
                 # Ordinary Telegram errors can omit parameters entirely.
@@ -554,30 +830,46 @@ class FakeTelegramHandler(BaseHTTPRequestHandler):
             self.state.hit("getFile", file_id)
             fixture = FILES.get(file_id)
 
-            if fixture is None:
+            if fixture is not None:
                 self._send_json(
-                    400,
+                    200,
                     {
-                        "ok": False,
-                        "error_code": 400,
-                        "description": (
-                            "Bad Request: wrong file identifier/"
-                            "HTTP URL specified"
-                        ),
+                        "ok": True,
+                        "result": {
+                            "file_id": file_id,
+                            "file_unique_id": fixture.file_unique_id,
+                            "file_size": len(fixture.data),
+                            "file_path": fixture.path,
+                        },
+                    },
+                )
+                return
+
+            pushed_data = self.state.get_uploaded(file_id)
+            if pushed_data is not None:
+                self._send_json(
+                    200,
+                    {
+                        "ok": True,
+                        "result": {
+                            "file_id": file_id,
+                            "file_unique_id": file_id + "_unique",
+                            "file_size": len(pushed_data),
+                            "file_path": f"push/{file_id}",
+                        },
                     },
                 )
                 return
 
             self._send_json(
-                200,
+                400,
                 {
-                    "ok": True,
-                    "result": {
-                        "file_id": file_id,
-                        "file_unique_id": fixture.file_unique_id,
-                        "file_size": len(fixture.data),
-                        "file_path": fixture.path,
-                    },
+                    "ok": False,
+                    "error_code": 400,
+                    "description": (
+                        "Bad Request: wrong file identifier/"
+                        "HTTP URL specified"
+                    ),
                 },
             )
             return
@@ -638,6 +930,75 @@ def http_get(url: str, timeout: float = 5.0) -> HttpResponse:
         url,
         method="GET",
         headers={"User-Agent": "StickersFTW-TestHarness/2.0"},
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            return HttpResponse(
+                status=response.status,
+                headers={
+                    key.lower(): value
+                    for key, value in response.headers.items()
+                },
+                body=response.read(),
+            )
+    except urllib.error.HTTPError as error:
+        return HttpResponse(
+            status=error.code,
+            headers={
+                key.lower(): value
+                for key, value in error.headers.items()
+            },
+            body=error.read(),
+        )
+
+
+_TEST_BOUNDARY = "StickersFTWTestHarnessBoundary1234567890"
+
+
+def build_multipart_body(
+    fields: dict[str, str],
+    files: dict[str, tuple[str, bytes, str]],
+) -> bytes:
+    parts: list[bytes] = []
+    for name, value in fields.items():
+        parts.append(
+            (
+                f"--{_TEST_BOUNDARY}\r\n"
+                f'Content-Disposition: form-data; name="{name}"\r\n\r\n'
+                f"{value}\r\n"
+            ).encode("utf-8")
+        )
+    for name, (filename, content, content_type) in files.items():
+        parts.append(
+            (
+                f"--{_TEST_BOUNDARY}\r\n"
+                f'Content-Disposition: form-data; name="{name}"; '
+                f'filename="{filename}"\r\n'
+                f"Content-Type: {content_type}\r\n\r\n"
+            ).encode("utf-8")
+            + content
+            + b"\r\n"
+        )
+    parts.append(f"--{_TEST_BOUNDARY}--\r\n".encode("utf-8"))
+    return b"".join(parts)
+
+
+def http_post_multipart(
+    url: str,
+    fields: dict[str, str],
+    files: dict[str, tuple[str, bytes, str]],
+    timeout: float = 5.0,
+) -> HttpResponse:
+    body = build_multipart_body(fields, files)
+    request = urllib.request.Request(
+        url,
+        data=body,
+        method="POST",
+        headers={
+            "User-Agent": "StickersFTW-TestHarness/2.0",
+            "Content-Type": f"multipart/form-data; boundary={_TEST_BOUNDARY}",
+        },
     )
 
     try:
@@ -834,7 +1195,7 @@ class Harness:
     def get_manifest(self) -> dict[str, Any]:
         if self._manifest_payload is None:
             response = http_get(
-                self.url(f"/set/{TEST_PACK}/"),
+                self.url(f"/v1/set/{TEST_PACK}/"),
                 timeout=self.timeout,
             )
             assert response.status == 200, (
@@ -879,14 +1240,14 @@ class Harness:
         for index, (returned, fixture) in enumerate(
             zip(payload["stickers"], STICKERS, strict=True)
         ):
-            expected_keys = {
-                "id",
-                "width",
-                "height",
-                "size",
-                "thumb",
-                "emoji",
-            }
+            # "thumb" and "emoji" are only present when the fixture actually
+            # has one -- the server omits absent optional fields entirely
+            # rather than emitting them as null.
+            expected_keys = {"id", "width", "height", "size"}
+            if fixture.thumbnail_public_id is not None:
+                expected_keys.add("thumb")
+            if fixture.emoji is not None:
+                expected_keys.add("emoji")
 
             if self.strict_schema:
                 assert set(returned) == expected_keys, (
@@ -940,7 +1301,7 @@ class Harness:
 
         for _ in range(10):
             response = http_get(
-                self.url(f"/set/{TEST_PACK}/"),
+                self.url(f"/v1/set/{TEST_PACK}/"),
                 timeout=self.timeout,
             )
             assert response.status == 200
@@ -957,11 +1318,11 @@ class Harness:
         before = self.fake_state.count("getStickerSet", SECOND_PACK)
 
         first = http_get(
-            self.url(f"/set/{SECOND_PACK}/"),
+            self.url(f"/v1/set/{SECOND_PACK}/"),
             timeout=self.timeout,
         )
         second = http_get(
-            self.url(f"/set/{SECOND_PACK}/"),
+            self.url(f"/v1/set/{SECOND_PACK}/"),
             timeout=self.timeout,
         )
 
@@ -978,7 +1339,7 @@ class Harness:
     ) -> None:
         expected_file = FILES[sticker.file_id]
         response = http_get(
-            self.url(f"/set/{TEST_PACK}/{sticker.public_id}/"),
+            self.url(f"/v1/set/{TEST_PACK}/{sticker.public_id}/"),
             timeout=self.timeout,
         )
 
@@ -1018,7 +1379,7 @@ class Harness:
 
             response = http_get(
                 self.url(
-                    f"/set/{TEST_PACK}/{sticker.public_id}/thumbnail/"
+                    f"/v1/set/{TEST_PACK}/{sticker.public_id}/thumbnail/"
                 ),
                 timeout=self.timeout,
             )
@@ -1047,7 +1408,7 @@ class Harness:
 
             response = http_get(
                 self.url(
-                    f"/set/{TEST_PACK}/{sticker.public_id}/thumbnail/"
+                    f"/v1/set/{TEST_PACK}/{sticker.public_id}/thumbnail/"
                 ),
                 timeout=self.timeout,
             )
@@ -1064,7 +1425,7 @@ class Harness:
 
     def test_unknown_sticker_id(self) -> None:
         response = http_get(
-            self.url(f"/set/{TEST_PACK}/does_not_exist/"),
+            self.url(f"/v1/set/{TEST_PACK}/does_not_exist/"),
             timeout=self.timeout,
         )
         assert response.status == 404, (
@@ -1075,7 +1436,7 @@ class Harness:
         # The public endpoint searches Sticker::id (file_unique_id), not file_id.
         fixture = STICKERS[0]
         response = http_get(
-            self.url(f"/set/{TEST_PACK}/{fixture.file_id}/"),
+            self.url(f"/v1/set/{TEST_PACK}/{fixture.file_id}/"),
             timeout=self.timeout,
         )
         assert response.status == 404, (
@@ -1095,7 +1456,7 @@ class Harness:
                 continue
             response = http_get(
                 self.url(
-                    f"/set/{TEST_PACK}/{sticker.public_id}/thumbnail/"
+                    f"/v1/set/{TEST_PACK}/{sticker.public_id}/thumbnail/"
                 ),
                 timeout=self.timeout,
             )
@@ -1156,7 +1517,7 @@ class Harness:
 
     def test_telegram_400_propagation(self) -> None:
         response = http_get(
-            self.url(f"/set/{MISSING_PACK}/"),
+            self.url(f"/v1/set/{MISSING_PACK}/"),
             timeout=self.timeout,
         )
         assert response.status == 400, (
@@ -1165,7 +1526,7 @@ class Harness:
 
     def test_malformed_telegram_json_becomes_500(self) -> None:
         response = http_get(
-            self.url(f"/set/{MALFORMED_JSON_PACK}/"),
+            self.url(f"/v1/set/{MALFORMED_JSON_PACK}/"),
             timeout=self.timeout,
         )
         assert response.status == 500, (
@@ -1175,7 +1536,7 @@ class Harness:
 
     def test_invalid_sticker_payload_becomes_500(self) -> None:
         response = http_get(
-            self.url(f"/set/{INVALID_STICKER_PACK}/"),
+            self.url(f"/v1/set/{INVALID_STICKER_PACK}/"),
             timeout=self.timeout,
         )
         assert response.status == 500, (
@@ -1185,7 +1546,7 @@ class Harness:
 
     def test_rate_limit(self) -> None:
         limited = http_get(
-            self.url(f"/set/{RATE_LIMITED_PACK}/"),
+            self.url(f"/v1/set/{RATE_LIMITED_PACK}/"),
             timeout=self.timeout,
         )
         assert limited.status == 429, (
@@ -1197,7 +1558,7 @@ class Harness:
             AFTER_RATE_LIMIT_PACK,
         )
         locally_blocked = http_get(
-            self.url(f"/set/{AFTER_RATE_LIMIT_PACK}/"),
+            self.url(f"/v1/set/{AFTER_RATE_LIMIT_PACK}/"),
             timeout=self.timeout,
         )
         after = self.fake_state.count(
@@ -1216,12 +1577,184 @@ class Harness:
         time.sleep(1.15)
 
         recovered = http_get(
-            self.url(f"/set/{AFTER_RATE_LIMIT_PACK}/"),
+            self.url(f"/v1/set/{AFTER_RATE_LIMIT_PACK}/"),
             timeout=self.timeout,
         )
         assert recovered.status == 200, (
             "expected recovery after retry_after, "
             f"got {recovered.status}"
+        )
+
+    def test_bot_info(self) -> None:
+        response = http_get(self.url("/v1/bot/"), timeout=self.timeout)
+        assert response.status == 200, f"expected 200, got {response.status}"
+        payload = response.json()
+        assert payload.get("username") == "StickersFTWTestBot", (
+            f"unexpected bot username: {payload}"
+        )
+
+    def test_push_creates_new_set(self) -> None:
+        sticker_bytes = make_webp("push:create", 4096)
+        response = http_post_multipart(
+            self.url("/v1/set/PushedNewPack/"),
+            fields={
+                "user_id": PUSH_VALID_USER_ID,
+                "title": "Pushed New Pack",
+                "format": "static",
+                "emojis": "🙂,✨",
+            },
+            files={"sticker": ("sticker.webp", sticker_bytes, "image/webp")},
+            timeout=self.timeout,
+        )
+        assert response.status == 201, (
+            f"expected 201 creating a new set, got {response.status}: "
+            f"{response.body!r}"
+        )
+        payload = response.json()
+        assert payload["name"] == "PushedNewPack_by_StickersFTWTestBot", (
+            f"unexpected full set name: {payload.get('name')!r}"
+        )
+        assert len(payload["stickers"]) == 1
+
+    def test_push_appends_to_existing_set(self) -> None:
+        # Uses its own short name so this test is independent of
+        # test_push_creates_new_set's ordering.
+        first = http_post_multipart(
+            self.url("/v1/set/PushedAppendPack/"),
+            fields={
+                "user_id": PUSH_VALID_USER_ID,
+                "title": "Pushed Append Pack",
+                "format": "static",
+                "emojis": "🙂",
+            },
+            files={
+                "sticker": (
+                    "sticker.webp",
+                    make_webp("push:append:first", 2048),
+                    "image/webp",
+                )
+            },
+            timeout=self.timeout,
+        )
+        assert first.status == 201, (
+            f"expected 201 for the initial push, got {first.status}"
+        )
+
+        second = http_post_multipart(
+            self.url("/v1/set/PushedAppendPack/"),
+            fields={
+                "user_id": PUSH_VALID_USER_ID,
+                "format": "static",
+                "emojis": "😺",
+            },
+            files={
+                "sticker": (
+                    "sticker.webp",
+                    make_webp("push:append:second", 2048),
+                    "image/webp",
+                )
+            },
+            timeout=self.timeout,
+        )
+        assert second.status == 200, (
+            f"expected 200 appending to an existing set, got "
+            f"{second.status}: {second.body!r}"
+        )
+        payload = second.json()
+        assert len(payload["stickers"]) == 2, (
+            f"expected 2 stickers after append, got "
+            f"{len(payload['stickers'])}"
+        )
+
+    def test_push_requires_title_for_new_set(self) -> None:
+        response = http_post_multipart(
+            self.url("/v1/set/PushedNoTitlePack/"),
+            fields={
+                "user_id": PUSH_VALID_USER_ID,
+                "format": "static",
+                "emojis": "🙂",
+            },
+            files={
+                "sticker": (
+                    "sticker.webp",
+                    make_webp("push:no-title", 1024),
+                    "image/webp",
+                )
+            },
+            timeout=self.timeout,
+        )
+        assert response.status == 400, (
+            "expected 400 without a title for a nonexistent set, got "
+            f"{response.status}"
+        )
+
+    def test_push_rejects_unstarted_user(self) -> None:
+        response = http_post_multipart(
+            self.url("/v1/set/PushedUnstartedPack/"),
+            fields={
+                "user_id": PUSH_UNSTARTED_USER_ID,
+                "title": "Should Fail",
+                "format": "static",
+                "emojis": "🙂",
+            },
+            files={
+                "sticker": (
+                    "sticker.webp",
+                    make_webp("push:unstarted", 1024),
+                    "image/webp",
+                )
+            },
+            timeout=self.timeout,
+        )
+        assert response.status == 400, (
+            "expected 400 for a user who hasn't started the bot, got "
+            f"{response.status}"
+        )
+        payload = response.json()
+        assert "PEER_ID_INVALID" in payload.get("description", ""), (
+            f"expected PEER_ID_INVALID surfaced in the error body, got "
+            f"{payload}"
+        )
+
+    def test_push_rejects_missing_fields(self) -> None:
+        response = http_post_multipart(
+            self.url("/v1/set/PushedMissingFieldsPack/"),
+            fields={"user_id": PUSH_VALID_USER_ID},
+            files={},
+            timeout=self.timeout,
+        )
+        assert response.status == 400, (
+            f"expected 400 for missing required fields, got "
+            f"{response.status}"
+        )
+
+    def test_pushed_sticker_is_downloadable(self) -> None:
+        sticker_bytes = make_webp("push:download", 3000)
+        push_response = http_post_multipart(
+            self.url("/v1/set/PushedDownloadPack/"),
+            fields={
+                "user_id": PUSH_VALID_USER_ID,
+                "title": "Pushed Download Pack",
+                "format": "static",
+                "emojis": "🙂",
+            },
+            files={"sticker": ("sticker.webp", sticker_bytes, "image/webp")},
+            timeout=self.timeout,
+        )
+        assert push_response.status == 201, (
+            f"expected 201, got {push_response.status}"
+        )
+        payload = push_response.json()
+        full_name = payload["name"]
+        sticker_id = payload["stickers"][0]["id"]
+
+        download = http_get(
+            self.url(f"/v1/set/{full_name}/{sticker_id}/"),
+            timeout=self.timeout,
+        )
+        assert download.status == 200, f"expected 200, got {download.status}"
+        assert download.body == sticker_bytes, (
+            "pushed sticker bytes did not round-trip through Telegram"
         )
 
     def test_graceful_shutdown(self) -> None:
@@ -1289,6 +1822,28 @@ class Harness:
                 self.test_invalid_sticker_payload_becomes_500,
             ),
             ("Telegram retry_after cooldown", self.test_rate_limit),
+            ("bot info endpoint", self.test_bot_info),
+            ("push creates a new set", self.test_push_creates_new_set),
+            (
+                "push appends to an existing set",
+                self.test_push_appends_to_existing_set,
+            ),
+            (
+                "push without title on new set fails",
+                self.test_push_requires_title_for_new_set,
+            ),
+            (
+                "push rejects a user who hasn't started the bot",
+                self.test_push_rejects_unstarted_user,
+            ),
+            (
+                "push rejects missing required fields",
+                self.test_push_rejects_missing_fields,
+            ),
+            (
+                "pushed sticker round-trips through download",
+                self.test_pushed_sticker_is_downloadable,
+            ),
             ("graceful interrupt shutdown", self.test_graceful_shutdown),
         ]
 
@@ -1400,6 +1955,14 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    # Fixture data and server debug logs can contain arbitrary Unicode
+    # (emoji, em-dashes); Windows consoles default to a narrow codepage
+    # (cp1252) that can't encode it, which would otherwise crash the
+    # harness while it's trying to report a failure.
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            stream.reconfigure(errors="replace")
+
     args = parse_args()
     executable = args.executable.expanduser().resolve()
 
