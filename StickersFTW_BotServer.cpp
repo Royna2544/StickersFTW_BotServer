@@ -426,16 +426,17 @@ public:
   }
 
   std::expected<GetStickerSetResponse, ErrorResponse>
-  getStickerSet(const std::string &sticker_set_name) {
+  getStickerSet(const std::string &sticker_set_name, bool force_refresh = false) {
     if (sticker_set_name.empty()) {
       spdlog::error("Sticker set name is empty.");
       return std::unexpected(
           ErrorResponse(HTTP_BAD_REQUEST, "Sticker set name is empty."));
     }
 
-    spdlog::debug("Received request for sticker set: {}", sticker_set_name);
+    spdlog::debug("Received request for sticker set: {} (force_refresh={})",
+                  sticker_set_name, force_refresh);
 
-    {
+    if (!force_refresh) {
       std::lock_guard<std::mutex> lock(cache_mutex);
       auto it = sticker_sets_cache.find(sticker_set_name);
       if (it != sticker_sets_cache.end()) {
@@ -445,6 +446,9 @@ public:
         // Return the cached sticker set information as JSON
         return it->second;
       }
+    } else {
+      spdlog::debug("Force refresh requested for '{}' -- bypassing cache.",
+                    sticker_set_name);
     }
 
     // Check if the Telegram API server is currently rate limited
@@ -807,6 +811,54 @@ public:
     return {};
   }
 
+  // Checks whether user_id has ever started a chat with this bot. Telegram
+  // gives bots no direct "has this user pressed Start" query -- the accepted
+  // workaround is that getChat on a private chat_id equal to the user's own
+  // numeric ID succeeds once (and stays succeeding after) they've started a
+  // conversation with the bot, and fails with 403 "Forbidden: bot can't
+  // initiate conversation with a user" (or 400 "chat not found") until then.
+  // Callers should run this before a push so a stale/unstarted user_id is
+  // caught with an actionable message instead of surfacing much later as a
+  // confusing per-sticker upload failure.
+  std::expected<bool, ErrorResponse>
+  verifyUserStartedChat(const std::string &user_id) {
+    if (user_id.empty()) {
+      return std::unexpected(
+          ErrorResponse(HTTP_BAD_REQUEST, "user_id is required."));
+    }
+    if (is_ratelimited()) {
+      return std::unexpected(
+          ErrorResponse(HTTP_TOO_MANY_REQUESTS, "Rate limit in effect."));
+    }
+    httplib::Params params{{"chat_id", user_id}};
+    auto response = cli.Post(make_api_url(token, "getChat"), params);
+    if (!response) {
+      return std::unexpected(ErrorResponse(
+          HTTP_INTERNAL_SERVER_ERROR, "Failed to reach Telegram API for getChat."));
+    }
+    auto body_opt = unwrapTelegramBody(response->body);
+    if (!body_opt) {
+      return std::unexpected(
+          ErrorResponse(HTTP_INTERNAL_SERVER_ERROR,
+                        "Failed to unwrap getChat response body."));
+    }
+    auto body = body_opt.value();
+    if (response->status == HTTP_OK) {
+      return true;
+    }
+    const std::string &desc = body.error().description;
+    if (desc.find("chat not found") != std::string::npos ||
+        desc.find("bot can't initiate conversation") != std::string::npos ||
+        desc.find("user is deactivated") != std::string::npos) {
+      spdlog::info("User '{}' has not started a chat with the bot yet.", user_id);
+      return false;
+    }
+    spdlog::error("Unexpected getChat error for user '{}'. Status code: {}. "
+                  "Description: {}",
+                  user_id, body.error().error_code, desc);
+    return std::unexpected(ErrorResponse(HTTP_INTERNAL_SERVER_ERROR, desc));
+  }
+
   struct PushResult {
     GetStickerSetResponse set;
     bool created;
@@ -893,6 +945,42 @@ public:
       return std::unexpected(refreshed.error());
     }
     return PushResult{refreshed.value(), created};
+  }
+
+  // Permanently deletes a sticker set this bot created. This is what backs
+  // DELETE /v1/set/{full_name}/.
+  std::expected<void, ErrorResponse>
+  deleteStickerSet(const std::string &full_name) {
+    if (full_name.empty()) {
+      return std::unexpected(
+          ErrorResponse(HTTP_BAD_REQUEST, "Sticker set name is required."));
+    }
+    if (is_ratelimited()) {
+      return std::unexpected(
+          ErrorResponse(HTTP_TOO_MANY_REQUESTS, "Rate limit in effect."));
+    }
+    httplib::Params params{{"name", full_name}};
+    auto response = cli.Post(make_api_url(token, "deleteStickerSet"), params);
+    if (!response) {
+      return std::unexpected(
+          ErrorResponse(HTTP_INTERNAL_SERVER_ERROR,
+                        "Failed to reach Telegram API for deleteStickerSet."));
+    }
+    auto body_opt = unwrapTelegramBody(response->body);
+    if (!body_opt) {
+      return std::unexpected(
+          ErrorResponse(HTTP_INTERNAL_SERVER_ERROR,
+                        "Failed to unwrap deleteStickerSet response body."));
+    }
+    auto body = body_opt.value();
+    if (response->status != HTTP_OK) {
+      return std::unexpected(http_code_err_handle(body.error(), "deleteStickerSet"));
+    }
+    {
+      std::lock_guard<std::mutex> lock(cache_mutex);
+      sticker_sets_cache.erase(full_name);
+    }
+    return {};
   }
 
   bool listen(std::string ipaddr, const int port) {
@@ -1004,14 +1092,18 @@ public:
       }
     });
 
-    // Sticker set get
+    // Sticker set get. "?force=true" bypasses the cache and re-fetches the
+    // set from Telegram -- clients use this for an explicit "refresh this
+    // pack now" action instead of waiting for the cache to naturally expire.
     svr.Get("/v1/set/([^/]+)/?",
             [&](const httplib::Request &req, httplib::Response &res) {
           std::string sticker_set_name = req.matches[1];
+          bool force_refresh = req.get_param_value("force") == "true";
 
-          spdlog::debug("Received request for sticker set: '{}'", sticker_set_name);
+          spdlog::debug("Received request for sticker set: '{}' (force={})",
+                       sticker_set_name, force_refresh);
 
-          auto sticker_set_result = getStickerSet(sticker_set_name);
+          auto sticker_set_result = getStickerSet(sticker_set_name, force_refresh);
           if (!sticker_set_result) {
             writeError(res, sticker_set_result.error());
           } else {
@@ -1020,6 +1112,21 @@ public:
           }
         });
 
+    // Permanently delete a sticker set this bot created.
+    svr.Delete("/v1/set/([^/]+)/?",
+              [&](const httplib::Request &req, httplib::Response &res) {
+      std::string full_name = req.matches[1];
+
+      spdlog::debug("Received delete request for sticker set: '{}'", full_name);
+
+      auto result = deleteStickerSet(full_name);
+      if (!result) {
+        writeError(res, result.error());
+        return;
+      }
+      res.status = HTTP_OK;
+    });
+
     // Bot identity get (purely informational -- lets clients show the
     // correct "@bot_username" in their own UI instructions).
     svr.Get("/v1/bot/?", [&](const httplib::Request &req,
@@ -1027,6 +1134,27 @@ public:
       (void)req;
       nlohmann::json j;
       j["username"] = bot_username;
+      res.set_content(j.dump(), "application/json");
+    });
+
+    // Verify a Telegram user_id has started a chat with the bot. Clients
+    // should call this before attempting a push -- pushSticker's own
+    // uploadStickerFile call also needs a started chat and would otherwise
+    // fail with the same underlying cause, but only after the user already
+    // waited through a download/convert pass.
+    svr.Get("/v1/user/([0-9]+)/verify/?",
+            [&](const httplib::Request &req, httplib::Response &res) {
+      std::string user_id = req.matches[1];
+
+      spdlog::debug("Received verify-user request for user_id: '{}'", user_id);
+
+      auto result = verifyUserStartedChat(user_id);
+      if (!result) {
+        writeError(res, result.error());
+        return;
+      }
+      nlohmann::json j;
+      j["started"] = result.value();
       res.set_content(j.dump(), "application/json");
     });
 
