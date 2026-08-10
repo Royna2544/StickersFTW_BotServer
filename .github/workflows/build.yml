@@ -65,9 +65,12 @@ jobs:
       # linked glibc would still need the matching NSS shared objects at
       # runtime to resolve api.telegram.org, which defeats the point.
       #
-      # Alpine 3.23 or newer is required: under musl vcpkg falls back to the
-      # system CMake, and its port scripts now use string(JSON STRING_ENCODE),
-      # which needs CMake 4.1+. Alpine 3.21 ships 3.31 and fails on brotli.
+      # vcpkg is pinned to the builtin-baseline from vcpkg.json rather than
+      # tracking its default branch. Under musl vcpkg sets
+      # VCPKG_FORCE_SYSTEM_BINARIES and uses the distro CMake instead of
+      # downloading its own, so newer vcpkg scripts can outrun it -- current
+      # ones call string(JSON STRING_ENCODE), added in CMake 4.3, and fail on
+      # brotli. Pinning keeps the scripts in step with the ports.
       - name: Build static x86_64 binary (Alpine/musl)
         run: |
           docker run --rm -i \
@@ -81,9 +84,11 @@ jobs:
 
           export VCPKG_FORCE_SYSTEM_BINARIES=1
 
-          # Full clone: the builtin-baseline in vcpkg.json is not reachable
-          # from a shallow one.
+          # Full clone: the builtin-baseline is not reachable from a shallow one.
+          baseline=$(python3 -c \
+            "import json; print(json.load(open('vcpkg.json'))['builtin-baseline'])")
           git clone https://github.com/microsoft/vcpkg /opt/vcpkg
+          git -C /opt/vcpkg checkout --quiet "$baseline"
           /opt/vcpkg/bootstrap-vcpkg.sh -disableMetrics
 
           cmake -S . -B out/build-linux -G Ninja \
