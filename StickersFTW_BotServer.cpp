@@ -11,10 +11,14 @@
 #include <nlohmann/json.hpp>
 #include <spdlog/spdlog.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cctype>
 #include <chrono>
 #include <cmath>
+#include <condition_variable>
+#include <cstdlib>
+#include <exception>
 #include <expected>
 #include <functional>
 #include <iostream>
@@ -22,8 +26,12 @@
 #include <optional>
 #include <queue>
 #include <ranges>
+#include <stop_token>
+#include <string>
+#include <string_view>
 #include <thread>
 #include <unordered_map>
+#include <utility>
 #include <vector>
 
 std::string make_api_url(const std::string_view token,

@@ -53,3 +53,59 @@ jobs:
           path: |
             out/**/StickersFTW*.exe
           if-no-files-found: error
+
+  linux-static:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v6
+
+      # Built inside Alpine so the binary links against musl. A statically
+      # linked glibc would still need the matching NSS shared objects at
+      # runtime to resolve api.telegram.org, which defeats the point.
+      - name: Build static x86_64 binary (Alpine/musl)
+        run: |
+          docker run --rm -i \
+            -v "$GITHUB_WORKSPACE:/src" \
+            -w /src \
+            alpine:3.21 \
+            sh -eu <<'BUILD'
+          apk add --no-cache \
+            build-base cmake ninja-build ninja-is-really-ninja \
+            git curl zip unzip tar bash perl linux-headers pkgconf python3
+
+          export VCPKG_FORCE_SYSTEM_BINARIES=1
+
+          # Full clone: the builtin-baseline in vcpkg.json is not reachable
+          # from a shallow one.
+          git clone https://github.com/microsoft/vcpkg /opt/vcpkg
+          /opt/vcpkg/bootstrap-vcpkg.sh -disableMetrics
+
+          cmake -S . -B out/build-linux -G Ninja \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_TOOLCHAIN_FILE=/opt/vcpkg/scripts/buildsystems/vcpkg.cmake \
+            -DVCPKG_TARGET_TRIPLET=x64-linux \
+            -DSTICKERSFTW_STATIC_LINK=ON
+
+          cmake --build out/build-linux --parallel
+          BUILD
+
+      - name: Verify the binary is fully static
+        run: |
+          bin=out/build-linux/StickersFTW_BotServer
+          file "$bin"
+          file "$bin" | grep -qE "statically linked|static-pie linked" || {
+            echo "::error::Binary is not statically linked"
+            exit 1
+          }
+
+      - name: Run integration tester
+        run: python3 bulk_tester.py out/build-linux/StickersFTW_BotServer --show-server-log
+
+      - name: Upload executable
+        uses: actions/upload-artifact@v4
+        with:
+          name: StickersFTW-Linux-x86_64-static
+          path: out/build-linux/StickersFTW_BotServer
+          if-no-files-found: error
