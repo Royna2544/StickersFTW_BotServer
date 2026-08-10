@@ -24,7 +24,7 @@ Note: 403 is reserved but never currently emitted by this server.
 ## Process arguments
 - `--port` - The port to run the server on. Default is 8080.
 - `--host` - The host to run the server on. Default is localhost.
-- `--token` - The Telegram bot token to use for the API. Required.
+- `--token` - The Telegram bot token to use for the API. Required, unless `STICKERSFTW_TOKEN` is set in the environment. Prefer the environment variable when running as a service: arguments are visible to any local user via `ps`.
 - `--log-level` - The log level to use for the server. Default is info. Options are: debug, info, warning, error, critical.
 - `--server` - The server to use for the API. Default is https://api.telegram.org.
 

@@ -1244,7 +1244,8 @@ int main(int argc, char *argv[]) {
                         cxxopts::value<int>()->default_value("8080"))(
       "h,host", "Host to run the server on",
       cxxopts::value<std::string>()->default_value("localhost"))(
-      "t,token", "Telegram bot token", cxxopts::value<std::string>())(
+      "t,token", "Telegram bot token (or set STICKERSFTW_TOKEN)",
+      cxxopts::value<std::string>())(
       "l,log-level", "Log level (debug, info, warning, error, critical)",
       cxxopts::value<std::string>()->default_value("info"))(
       "s,server", "Telegram API server URL",
@@ -1264,12 +1265,20 @@ int main(int argc, char *argv[]) {
     return EXIT_SUCCESS;
   }
 
-  if (!result.count("token")) {
-    spdlog::error("Telegram bot token is required.");
+  // Prefer --token, but fall back to the environment so the token need not
+  // appear on the command line, where any local user can read it out of ps.
+  std::string token;
+  if (result.count("token")) {
+    token = result["token"].as<std::string>();
+  } else if (const char *env_token = std::getenv("STICKERSFTW_TOKEN");
+             env_token != nullptr && *env_token != '\0') {
+    token = env_token;
+  } else {
+    spdlog::error("Telegram bot token is required. Pass --token or set "
+                  "STICKERSFTW_TOKEN.");
     return EXIT_FAILURE;
   }
 
-  std::string token = result["token"].as<std::string>();
   std::string host = result["host"].as<std::string>();
   int port = result["port"].as<int>();
   std::string api_server = "https://api.telegram.org";
@@ -1335,12 +1344,15 @@ int main(int argc, char *argv[]) {
     }
   });
 
-  if (!engine.listen(host, port)) {
+  const bool listen_ok = engine.listen(host, port);
+  if (!listen_ok) {
     running = false;
     spdlog::error("Failed to start server on {}:{}", host, port);
   }
   stop_source.request_stop();
 
   spdlog::info("Shutting down server...");
-  return EXIT_SUCCESS;
+  // Report the failure to the caller; a service manager cannot distinguish a
+  // failed start from a clean shutdown otherwise.
+  return listen_ok ? EXIT_SUCCESS : EXIT_FAILURE;
 }
