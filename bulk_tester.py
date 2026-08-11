@@ -72,6 +72,8 @@ AFTER_RATE_LIMIT_PACK = "AfterRateLimit_by_FakeBot"
 # API rejects PUSH_UNSTARTED_USER_ID with PEER_ID_INVALID to simulate that.
 PUSH_VALID_USER_ID = "555555555"
 PUSH_UNSTARTED_USER_ID = "999999999"
+START_LINK_USER_ID = 777777777
+PLAIN_START_USER_ID = 888888888
 
 STICKER_COUNT = 120
 
@@ -381,6 +383,9 @@ class FakeTelegramState:
         # keyed by their full "<name>_by_<bot_username>" Telegram name.
         self.created_sets: dict[str, dict[str, Any]] = {}
         self.uploaded_files: dict[str, bytes] = {}
+        self.pending_updates: list[dict[str, Any]] = []
+        self.sent_messages: list[dict[str, Any]] = []
+        self.next_update_id = 1000
 
     def hit(self, operation: str, key: str = "") -> None:
         with self._lock:
@@ -433,6 +438,48 @@ class FakeTelegramState:
                 "owner": data["owner"],
                 "stickers": list(data["stickers"]),
             }
+
+    def enqueue_private_message(self, user_id: int, text: str) -> int:
+        with self._lock:
+            update_id = self.next_update_id
+            self.next_update_id += 1
+            self.pending_updates.append(
+                {
+                    "update_id": update_id,
+                    "message": {
+                        "message_id": update_id,
+                        "from": {
+                            "id": user_id,
+                            "is_bot": False,
+                            "first_name": "Test User",
+                        },
+                        "chat": {
+                            "id": user_id,
+                            "type": "private",
+                            "first_name": "Test User",
+                        },
+                        "text": text,
+                    },
+                }
+            )
+            return update_id
+
+    def get_updates(self, offset: int) -> list[dict[str, Any]]:
+        with self._lock:
+            self.pending_updates = [
+                item
+                for item in self.pending_updates
+                if int(item["update_id"]) >= offset
+            ]
+            return list(self.pending_updates[:100])
+
+    def record_sent_message(self, message: dict[str, Any]) -> None:
+        with self._lock:
+            self.sent_messages.append(message)
+
+    def sent_messages_snapshot(self) -> list[dict[str, Any]]:
+        with self._lock:
+            return list(self.sent_messages)
 
 
 def parse_multipart_formdata(body: bytes, content_type: str) -> dict[str, bytes]:
@@ -488,7 +535,10 @@ class FakeTelegramHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Connection", "close")
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def _send_bytes(
         self,
@@ -501,7 +551,10 @@ class FakeTelegramHandler(BaseHTTPRequestHandler):
         self.send_header("Content-Length", str(len(body)))
         self.send_header("Connection", "close")
         self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            pass
 
     def _parse_bot_method(self) -> tuple[Optional[str], Optional[str]]:
         parsed = urllib.parse.urlsplit(self.path)
@@ -540,6 +593,50 @@ class FakeTelegramHandler(BaseHTTPRequestHandler):
                         "is_bot": True,
                         "first_name": "StickersFTW Test Bot",
                         "username": "StickersFTWTestBot",
+                    },
+                },
+            )
+            return
+
+        if method == "getUpdates":
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length)
+            params = urllib.parse.parse_qs(body.decode("utf-8"))
+            offset = int(params.get("offset", ["0"])[0])
+            self.state.hit("getUpdates", str(offset))
+            updates = self.state.get_updates(offset)
+            if not updates:
+                # Real getUpdates blocks until an update or the requested
+                # timeout. A short pause prevents the fake from becoming a
+                # CPU-burning busy loop without slowing the test suite.
+                time.sleep(0.05)
+            self._send_json(200, {"ok": True, "result": updates})
+            return
+
+        if method == "sendMessage":
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length)
+            params = urllib.parse.parse_qs(body.decode("utf-8"))
+            chat_id = params.get("chat_id", [""])[0]
+            text = params.get("text", [""])[0]
+            reply_markup_raw = params.get("reply_markup", ["{}"])[0]
+            reply_markup = json.loads(reply_markup_raw)
+            self.state.hit("sendMessage", chat_id)
+            self.state.record_sent_message(
+                {
+                    "chat_id": chat_id,
+                    "text": text,
+                    "reply_markup": reply_markup,
+                }
+            )
+            self._send_json(
+                200,
+                {
+                    "ok": True,
+                    "result": {
+                        "message_id": self.state.count("sendMessage", chat_id),
+                        "chat": {"id": int(chat_id), "type": "private"},
+                        "text": text,
                     },
                 },
             )
@@ -1593,6 +1690,48 @@ class Harness:
             f"unexpected bot username: {payload}"
         )
 
+    def wait_for_sent_message(
+        self,
+        start_index: int,
+        user_id: int,
+    ) -> dict[str, Any]:
+        deadline = time.monotonic() + self.timeout
+        while time.monotonic() < deadline:
+            messages = self.fake_state.sent_messages_snapshot()
+            for message in messages[start_index:]:
+                if message["chat_id"] == str(user_id):
+                    return message
+            time.sleep(0.05)
+        raise AssertionError(
+            f"timed out waiting for onboarding reply to user {user_id}"
+        )
+
+    def assert_onboarding_reply(self, user_id: int, command: str) -> None:
+        start_index = len(self.fake_state.sent_messages_snapshot())
+        self.fake_state.enqueue_private_message(user_id, command)
+        message = self.wait_for_sent_message(start_index, user_id)
+
+        assert "Bot can convert your stickers now!" in message["text"]
+        assert str(user_id) in message["text"]
+        keyboard = message["reply_markup"].get("inline_keyboard")
+        assert keyboard and keyboard[0], (
+            f"missing inline copy keyboard: {message['reply_markup']}"
+        )
+        button = keyboard[0][0]
+        assert button.get("text") == "Copy user ID"
+        assert button.get("copy_text", {}).get("text") == str(user_id), (
+            f"copy button contains the wrong ID: {button}"
+        )
+
+    def test_deep_link_start_reply(self) -> None:
+        self.assert_onboarding_reply(
+            START_LINK_USER_ID,
+            "/start ftw_connect_v1",
+        )
+
+    def test_plain_start_reply(self) -> None:
+        self.assert_onboarding_reply(PLAIN_START_USER_ID, "/start")
+
     def test_push_creates_new_set(self) -> None:
         sticker_bytes = make_webp("push:create", 4096)
         response = http_post_multipart(
@@ -1823,6 +1962,14 @@ class Harness:
             ),
             ("Telegram retry_after cooldown", self.test_rate_limit),
             ("bot info endpoint", self.test_bot_info),
+            (
+                "deep-link /start replies with copyable user ID",
+                self.test_deep_link_start_reply,
+            ),
+            (
+                "plain /start replies with copyable user ID",
+                self.test_plain_start_reply,
+            ),
             ("push creates a new set", self.test_push_creates_new_set),
             (
                 "push appends to an existing set",

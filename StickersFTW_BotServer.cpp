@@ -17,6 +17,7 @@
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
+#include <cstdint>
 #include <cstdlib>
 #include <exception>
 #include <expected>
@@ -324,7 +325,11 @@ std::optional<std::string> sanitizeShortName(const std::string &raw) {
 
 class StickerFTWEngine {
   httplib::Client cli; // Client of Telegram API Server
+  // Kept separate from cli: getUpdates is a blocking long-poll request, while
+  // REST handlers still need to make ordinary Telegram API calls concurrently.
+  httplib::Client updates_cli;
   httplib::Server svr; // HTTP Server for serving requests
+  std::jthread updates_thread;
 
   std::mutex ratelimit_mutex; // Mutex for rate limit handling
   std::optional<std::chrono::system_clock::time_point>
@@ -350,13 +355,154 @@ class StickerFTWEngine {
 
 public:
   explicit StickerFTWEngine(std::string token, std::string api_server)
-      : cli(api_server.c_str()), svr(), token(token) {
+      : cli(api_server.c_str()), updates_cli(api_server.c_str()), svr(),
+        token(token) {
     // Initialize the HTTP client and server
+    // Keep this longer than getUpdates' timeout so a normal empty poll is not
+    // mistaken for a network failure.
+    updates_cli.set_read_timeout(15, 0);
   }
 
   void shutdown() {
+    if (updates_thread.joinable()) {
+      updates_thread.request_stop();
+    }
     svr.stop();
     cli.stop();
+    updates_cli.stop();
+  }
+
+  static constexpr std::string_view START_LINK_PAYLOAD = "ftw_connect_v1";
+
+  // Returns the optional argument from a /start command. Telegram deep links
+  // produce "/start <payload>" in a private chat; accepting an empty payload
+  // also keeps the ordinary, manually-sent /start command useful.
+  std::optional<std::string> startPayload(const std::string &text) const {
+    if (text == "/start") {
+      return std::string{};
+    }
+
+    const std::string direct_prefix = "/start ";
+    if (text.starts_with(direct_prefix)) {
+      return text.substr(direct_prefix.size());
+    }
+
+    const std::string mentioned_prefix = "/start@" + bot_username + " ";
+    if (text.starts_with(mentioned_prefix)) {
+      return text.substr(mentioned_prefix.size());
+    }
+    return std::nullopt;
+  }
+
+  bool sendOnboardingReply(const std::int64_t chat_id,
+                           const std::int64_t user_id) {
+    const std::string user_id_text = std::to_string(user_id);
+    nlohmann::json reply_markup = {
+        {"inline_keyboard",
+         nlohmann::json::array(
+             {nlohmann::json::array({{{"text", "Copy user ID"},
+                                      {"copy_text", {{"text", user_id_text}}}}})})}};
+    httplib::Params params{
+        {"chat_id", std::to_string(chat_id)},
+        {"text", fmt::format("Bot can convert your stickers now!\n\n"
+                             "Your Telegram user ID:\n{}\n\n"
+                             "Copy it into Stickers FTW -> Settings -> "
+                             "Telegram Push.",
+                             user_id_text)},
+        {"reply_markup", reply_markup.dump()},
+    };
+
+    auto response =
+        updates_cli.Post(make_api_url(token, "sendMessage"), params);
+    if (!response) {
+      spdlog::error("Failed to send /start onboarding reply to user {}.",
+                    user_id);
+      return false;
+    }
+    auto body = unwrapTelegramBody(response->body);
+    if (response->status != HTTP_OK || !body || !body->has_value()) {
+      spdlog::error("Telegram rejected /start onboarding reply to user {} "
+                    "(status {}).",
+                    user_id, response->status);
+      return false;
+    }
+    spdlog::info("Sent Telegram onboarding reply to user {}.", user_id);
+    return true;
+  }
+
+  void handleUpdate(const nlohmann::json &update) {
+    if (!update.contains("message") || !update["message"].is_object()) {
+      return;
+    }
+    const auto &message = update["message"];
+    if (!message.contains("chat") || !message["chat"].is_object() ||
+        message["chat"].value("type", "") != "private" ||
+        !message.contains("from") || !message["from"].is_object() ||
+        message["from"].value("is_bot", false) ||
+        !message.contains("text") || !message["text"].is_string()) {
+      return;
+    }
+
+    auto payload = startPayload(message["text"].get<std::string>());
+    if (!payload || (!payload->empty() && *payload != START_LINK_PAYLOAD)) {
+      return;
+    }
+
+    const std::int64_t chat_id = message["chat"].value("id", std::int64_t{});
+    const std::int64_t user_id = message["from"].value("id", std::int64_t{});
+    if (chat_id == 0 || user_id == 0) {
+      spdlog::warn("Ignoring /start update without a chat or user ID.");
+      return;
+    }
+    sendOnboardingReply(chat_id, user_id);
+  }
+
+  void receiveUpdates(std::stop_token stop_token) {
+    std::int64_t offset = 0;
+    while (!stop_token.stop_requested()) {
+      httplib::Params params{
+          {"offset", std::to_string(offset)},
+          {"timeout", "10"},
+          {"allowed_updates", R"(["message"])"},
+      };
+      auto response =
+          updates_cli.Post(make_api_url(token, "getUpdates"), params);
+      if (stop_token.stop_requested()) {
+        break;
+      }
+      if (!response) {
+        spdlog::warn("Telegram getUpdates request failed; retrying.");
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        continue;
+      }
+
+      auto body = unwrapTelegramBody(response->body);
+      if (response->status != HTTP_OK || !body || !body->has_value()) {
+        if (response->status == 409) {
+          spdlog::error("Telegram getUpdates conflicts with an active webhook; "
+                        "remove the webhook to enable /start replies.");
+        } else {
+          spdlog::warn("Telegram getUpdates failed with status {}; retrying.",
+                       response->status);
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(2));
+        continue;
+      }
+      if (!body->value().is_array()) {
+        spdlog::warn("Telegram getUpdates returned a non-array result.");
+        continue;
+      }
+
+      for (const auto &update : body->value()) {
+        const std::int64_t update_id =
+            update.value("update_id", std::int64_t{-1});
+        if (update_id < 0) {
+          continue;
+        }
+        handleUpdate(update);
+        offset = std::max(offset, update_id + 1);
+      }
+    }
   }
 
   bool
@@ -1017,6 +1163,9 @@ public:
       return false;
     }
     spdlog::info("Authenticated as bot @{}", bot_username);
+
+    updates_thread = std::jthread(
+        [this](std::stop_token stop_token) { receiveUpdates(stop_token); });
 
     // Thumbnail image get
     svr.Get("/v1/set/([^/]+)/([^/]+)/thumbnail/?",

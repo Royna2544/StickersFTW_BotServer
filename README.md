@@ -2,6 +2,12 @@
 
 ## A simple bot server for downloading stickers from Telegram using its bot API, and for pushing new sticker packs to Telegram.
 
+The server also consumes private `/start` messages. Open
+`https://t.me/<bot_username>?start=ftw_connect_v1` (or send `/start`
+manually) and the bot replies with the sender's numeric Telegram user ID plus
+a one-tap copy button. Paste that ID into Stickers FTW's Telegram Push
+settings before publishing a pack.
+
 ### API (v1)
 All routes are under `/v1`. A trailing slash is optional on every route (both `/v1/set/name` and `/v1/set/name/` work).
 
@@ -27,6 +33,10 @@ Note: 403 is reserved but never currently emitted by this server.
 - `--token` - The Telegram bot token to use for the API. Required, unless `STICKERSFTW_TOKEN` is set in the environment. Prefer the environment variable when running as a service: arguments are visible to any local user via `ps`.
 - `--log-level` - The log level to use for the server. Default is info. Options are: debug, info, warning, error, critical.
 - `--server` - The server to use for the API. Default is https://api.telegram.org.
+
+The interactive `/start` handler uses Bot API long polling. Telegram does not
+allow `getUpdates` while the bot has an outgoing webhook configured; remove any
+existing webhook before running this server if its logs report a conflict.
 
 ## Response format
 
